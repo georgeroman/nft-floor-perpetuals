@@ -4,6 +4,7 @@ pragma solidity ^0.8.13;
 import {Owned} from "solmate/auth/Owned.sol";
 import {ERC4626} from "solmate/mixins/ERC4626.sol";
 import {WETH} from "solmate/tokens/WETH.sol";
+import {TrustusPacket} from "./interfaces/trustus/TrustusPacket.sol";
 
 import {Pool} from "./Pool.sol";
 
@@ -66,6 +67,19 @@ contract Exchange is Owned {
     WETH public immutable weth =
         WETH(payable(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2));
 
+    bytes32 public immutable DOMAIN_SEPARATOR =
+        keccak256(
+            abi.encode(
+                keccak256(
+                    "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
+                ),
+                keccak256("SingleUserBackedLendingVault"),
+                keccak256("1"),
+                block.chainid,
+                address(this)
+            )
+        );
+
     // --- Fields ---
 
     // Every position must have a margin of at least 0.01 ETH
@@ -119,12 +133,49 @@ contract Exchange is Owned {
         PositionKind positionKind,
         uint256 margin,
         uint256 leverage,
-        uint256 oraclePrice
+        uint256 oraclePrice,
+        TrustusPacket calldata packet
     ) public payable returns (bytes32 positionId) {
         // TODO: Pass and validate TrustUs message instead of passing the oracle price directly
+        require(packet.deadline >= block.timestamp, "Packet expired");
+        require(
+            packet.request ==
+                keccak256(
+                    abi.encodePacked(
+                        "twap",
+                        "contract",
+                        loan.collateralContractAddress
+                    )
+                ),
+            "Invalid packet"
+        );
 
+        // Validate the Trustus packet's signature.
+        address signer = ecrecover(
+            keccak256(
+                abi.encodePacked(
+                    "\x19\x01",
+                    DOMAIN_SEPARATOR,
+                    keccak256(
+                        abi.encode(
+                            keccak256(
+                                "VerifyPacket(bytes32 request,uint256 deadline,bytes payload)"
+                            ),
+                            packet.request,
+                            packet.deadline,
+                            keccak256(packet.payload)
+                        )
+                    )
+                )
+            ),
+            packet.v,
+            packet.r,
+            packet.s
+        );
+        require(signer == oracle, "Unauthorized signer");
+        
         require(margin >= minMargin, "Invalid margin");
-
+        
         NFTProduct storage nftProduct = nftProducts[nftContractAddress];
         require(
             leverage >= UNIT && leverage <= nftProduct.maxLeverage,
