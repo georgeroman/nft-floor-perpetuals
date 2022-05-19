@@ -141,11 +141,7 @@ contract Exchange is Owned {
         require(
             packet.request ==
                 keccak256(
-                    abi.encodePacked(
-                        "twap",
-                        "contract",
-                        loan.collateralContractAddress
-                    )
+                    abi.encodePacked("twap", "contract", nftContractAddress)
                 ),
             "Invalid packet"
         );
@@ -173,9 +169,9 @@ contract Exchange is Owned {
             packet.s
         );
         require(signer == oracle, "Unauthorized signer");
-        
+
         require(margin >= minMargin, "Invalid margin");
-        
+
         NFTProduct storage nftProduct = nftProducts[nftContractAddress];
         require(
             leverage >= UNIT && leverage <= nftProduct.maxLeverage,
