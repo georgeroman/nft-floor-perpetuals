@@ -22,6 +22,7 @@ contract OracleFeedConsumer is Owned {
     // -- GETTERS --
 
     function getPrice(address token) public view returns (uint256) {
+        // TODO: Add time stale verification
         // require(
         //     block.timestamp - lastTimestamp > maxTimeDifference,
         //     "!price-stale"
@@ -37,7 +38,62 @@ contract OracleFeedConsumer is Owned {
         view
         returns (AggregatorV3Interface)
     {
+        require(nftPriceFeeds[token] != address(0), "!empty-address");
         return AggregatorV3Interface(nftPriceFeeds[token]);
+    }
+
+    function getTwapPrice(address token, uint256 interval)
+        external
+        view
+        returns (uint256)
+    {
+        AggregatorV3Interface aggregator = getPriceFeedForToken(token);
+        require(interval != 0, "!interval");
+
+        (
+            uint80 round,
+            uint256 latestPrice,
+            uint256 latestTimestamp
+        ) = getChainlinkLatestRoundData(aggregator);
+
+        uint256 baseTimestamp = block.timestamp - interval;
+
+        if (lastTimestamp < baseTimestamp || round == 0) {
+            return latestPrice;
+        }
+
+        uint256 previousTimestamp = latestTimestamp;
+        uint256 cumulativeTime = block.timestamp - previousTimestamp;
+        uint256 weightedPrice = latestPrice * cumulativeTime;
+
+        while (true) {
+            if (round == 0) {
+                return weightedPrice / cumulativeTime;
+            }
+
+            round = round - 1;
+
+            (
+                ,
+                uint256 currentPrice,
+                uint256 currentTimestamp
+            ) = getChainlinkRoundData(aggregator, round);
+
+            if (currentTimestamp <= baseTimestamp) {
+                weightedPrice =
+                    weightedPrice +
+                    currentPrice *
+                    (previousTimestamp - baseTimestamp);
+                break;
+            }
+
+            uint256 timeFraction = previousTimestamp - currentTimestamp;
+            weightedPrice = weightedPrice + currentPrice * timeFraction;
+            cumulativeTime = cumulativeTime + timeFraction;
+            previousTimestamp = currentTimestamp;
+        }
+
+        return weightedPrice / interval;
     }
 
     // -- INTERNAL --
@@ -47,6 +103,7 @@ contract OracleFeedConsumer is Owned {
         view
         returns (uint256, uint256)
     {
+        //TODO: Update decimals
         AggregatorV3Interface feed = AggregatorV3Interface(
             nftPriceFeeds[token]
         );
@@ -55,6 +112,55 @@ contract OracleFeedConsumer is Owned {
         require(price > 0, "!chainlink-price");
 
         return (uint256(price), timestamp);
+    }
+
+    function getChainlinkLatestRoundData(AggregatorV3Interface _aggregator)
+        internal
+        view
+        returns (
+            uint80,
+            uint256 finalPrice,
+            uint256
+        )
+    {
+        (
+            uint80 round,
+            int256 latestPrice,
+            ,
+            uint256 latestTimestamp,
+
+        ) = _aggregator.latestRoundData();
+        finalPrice = uint256(latestPrice);
+        // if (latestPrice < 0) { // TODO: Not sure why price can be negative
+        //     require(round > 0, "!round");
+        //     (round, finalPrice, latestTimestamp) = getRoundData(
+        //         _aggregator,
+        //         round - 1
+        //     );
+        // }
+        return (round, finalPrice, latestTimestamp);
+    }
+
+    function getChainlinkRoundData(
+        AggregatorV3Interface _aggregator,
+        uint80 _round
+    )
+        internal
+        view
+        returns (
+            uint80,
+            uint256,
+            uint256
+        )
+    {
+        (
+            uint80 round,
+            int256 latestPrice,
+            ,
+            uint256 latestTimestamp,
+
+        ) = _aggregator.getRoundData(_round);
+        return (round, uint256(latestPrice), latestTimestamp);
     }
 
     // -- KEEPER FUNCTIONS --
