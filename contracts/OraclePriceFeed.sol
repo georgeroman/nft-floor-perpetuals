@@ -96,6 +96,23 @@ contract OracleFeedConsumer is Owned {
         return weightedPrice / interval;
     }
 
+    function getLastNPrices(address token, uint8 n)
+        external
+        view
+        returns (uint256[] memory)
+    {
+        AggregatorV3Interface aggregator = getPriceFeedForToken(token);
+        uint256[] memory prices = new uint256[](n);
+
+        (uint80 roundId, , , , ) = aggregator.latestRoundData();
+
+        for (uint256 i = 0; i < n; i++) {
+            (, uint256 price, ) = getChainlinkRoundData(aggregator, roundId);
+            prices[i] = price;
+        }
+        return prices;
+    }
+
     // -- INTERNAL --
 
     function getChainlinkPrice(address token)

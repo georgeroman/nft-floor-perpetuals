@@ -106,6 +106,10 @@ contract Exchange is Owned {
     // Address of the pool that handles liquidity provision
     address public pool;
 
+    // TODO: See if you can calculate this off-chain or in the Exchange contract
+    // Address of the contract that handles the fee calculation
+    address feeCalculator;
+
     // Mapping from NFT contract address to tradeable NFT product details
     mapping(address => NFTProduct) public nftProducts;
 
@@ -119,11 +123,14 @@ contract Exchange is Owned {
 
     // --- Constructor ---
 
-    constructor(address ownerAddress, address oracleAddress)
-        Owned(ownerAddress)
-    {
+    constructor(
+        address ownerAddress,
+        address oracleAddress,
+        address feeCalculatorAddress
+    ) Owned(ownerAddress) {
         oracle = oracleAddress;
         pool = address(new Pool(address(this)));
+        feeCalculator = feeCalculatorAddress;
     }
 
     // --- Public ---
