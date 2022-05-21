@@ -55,6 +55,7 @@ contract Exchange is Owned {
         uint256 leverage;
         uint256 timestamp;
         uint256 price;
+        bool isLong;
     }
 
     // --- Constants ---
@@ -106,24 +107,56 @@ contract Exchange is Owned {
     // Address of the pool that handles liquidity provision
     address public pool;
 
+    // allow anyone to liquidate
+    bool allowPublicLiquidator = false;
+
+    // payment token for liquidators
+    address public token;
+
+    // tokenBase
+    uint256 public tokenBase;
+
+    // token BASE
+    uint256 public constant BASE = 10**8;
+
+
     // Mapping from NFT contract address to tradeable NFT product details
     mapping(address => NFTProduct) public nftProducts;
 
     // Indexed by position id
     mapping(bytes32 => Position) public positions;
 
+    // allowed addresses that can call liquidations
+    mapping(address => bool) public liquidators;
+
     // --- Events ---
 
     event NFTProductAdded(address nftContractAddress);
     event NFTProductRemoved(address nftContractAddress);
 
+    event Log(address);
+
+    // event ClosePosition(
+    //             bytes32 positionId,
+    //             address positionOwner,
+    //             uint256 price,
+    //             uint256 positionPrice,
+    //             uint256 positionMargin,
+    //             uint256 positionLeverage,
+    //             uint256 fee,
+    //             int256 pnl,
+    //             bool wasLiquidated
+    // );
+
     // --- Constructor ---
 
-    constructor(address ownerAddress, address oracleAddress)
+    constructor(address ownerAddress, address oracleAddress, address _token, uint256 _tokenBase)
         Owned(ownerAddress)
     {
         oracle = oracleAddress;
         pool = address(new Pool(address(this)));
+        token = _token;
+        tokenBase = _tokenBase;
     }
 
     // --- Public ---
@@ -144,7 +177,7 @@ contract Exchange is Owned {
                     abi.encodePacked(
                         "twap",
                         "contract",
-                        loan.collateralContractAddress
+                        nftContractAddress
                     )
                 ),
             "Invalid packet"
@@ -172,6 +205,7 @@ contract Exchange is Owned {
             packet.r,
             packet.s
         );
+        emit Log(signer);
         require(signer == oracle, "Unauthorized signer");
         
         require(margin >= minMargin, "Invalid margin");
@@ -247,11 +281,243 @@ contract Exchange is Owned {
             margin: margin,
             leverage: leverage,
             price: price,
-            timestamp: timestamp
+            timestamp: timestamp,
+            isLong: positionKind == PositionKind.LONG
         });
 
         // TODO: Emit event
     }
+
+    // NOT FINISHED
+    function liquidatePositions(uint256[] calldata positionIds, address[] calldata nftAddresses) external {
+        require(
+            liquidators[msg.sender] || allowPublicLiquidator,
+            "!liquidator"
+        );
+
+        require(positionIds.length == nftAddresses, "Parameter arrays length must be equal");
+
+        uint256 totalLiquidatorReward;
+        for (uint256 i = 0; i < positionIds.length; i++) {
+            uint256 positionId = positionIds[i];
+            uint256 liquidatorReward = liquidatePosition(positionId, nftAddresses[i]);
+            totalLiquidatorReward = totalLiquidatorReward.add(liquidatorReward);
+        }
+        if (totalLiquidatorReward > 0) {
+            IERC20(token).uniTransfer(
+                msg.sender,
+                totalLiquidatorReward.mul(tokenBase).div(BASE)
+            );
+        }
+    }
+
+    // NOT FINISHED
+    function liquidatePosition(uint256 positionId, address nftAddress)
+        private
+        returns (uint256 liquidatorReward)
+    {
+        Position storage position = positions[positionId];
+        if (position.productId == 0) {
+            return 0;
+        }
+        NFTProduct storage product = nftProducts[nftAddress];
+        uint256 price = IOracle(oracle).getPrice(nftAddress); // use oracle price for liquidation
+
+        uint256 remainingReward;
+        if (
+            PerpLib._checkLiquidation(
+                position.isLong,
+                position.price,
+                position.leverage,
+                price,
+                uint256(product.liquidationThreshold)
+            )
+        ) {
+            int256 pnl = PerpLib._getPnl(
+                position.isLong,
+                position.price,
+                position.leverage,
+                position.margin,
+                price
+            );
+            if (pnl < 0 && uint256(position.margin) > uint256(-1 * pnl)) {
+                uint256 _pnl = uint256(-1 * pnl);
+                liquidatorReward = (uint256(position.margin).sub(_pnl))
+                    .mul(uint256(product.liquidationBounty))
+                    .div(10**4);
+                remainingReward = (
+                    uint256(position.margin).sub(_pnl).sub(liquidatorReward)
+                );
+                pendingProtocolReward = pendingProtocolReward.add(
+                    remainingReward.mul(protocolRewardRatio).div(10**4)
+                );
+                pendingPikaReward = pendingPikaReward.add(
+                    remainingReward.mul(pikaRewardRatio).div(10**4)
+                );
+                pendingVaultReward = pendingVaultReward.add(
+                    remainingReward
+                        .mul(10**4 - protocolRewardRatio - pikaRewardRatio)
+                        .div(10**4)
+                );
+                vault.balance += uint96(_pnl);
+            } else {
+                vault.balance += uint96(position.margin);
+            }
+
+            uint256 amount = uint256(position.margin)
+                .mul(uint256(position.leverage))
+                .div(BASE);
+
+            PositionKind memory positionKind = PositionKind.LONG;
+
+            if (!position.isLong) {
+                positionKind = PositionKind.SHORT;
+            }
+
+            _updateOpenInterest(
+                nftAddress,
+                positionKind,
+                OrderKind.CLOSE,
+                amount
+            );
+
+            // emit ClosePosition(
+            //     positionId,
+            //     position.owner,
+            //     uint256(position.productId),
+            //     price,
+            //     uint256(position.price),
+            //     uint256(position.margin),
+            //     uint256(position.leverage),
+            //     0,
+            //     -1 * int256(uint256(position.margin)),
+            //     true
+            // );
+
+            delete positions[positionId];
+
+            // emit PositionLiquidated(
+            //     positionId,
+            //     msg.sender,
+            //     liquidatorReward,
+            //     remainingReward
+            // );
+        }
+        return liquidatorReward;
+    }
+
+    //     function closePosition(
+//         address user,
+//         uint256 productId,
+//         uint256 margin,
+//         bool isLong
+//     ) external {
+//         return
+//             closePositionWithId(getPositionId(user, productId, isLong), margin);
+//     }
+
+//     // Closes position from Position with id = positionId
+//     function closePositionWithId(uint256 positionId, uint256 margin)
+//         public
+//         nonReentrant
+//     {
+//         // Check position
+//         Position storage position = positions[positionId];
+//         require(
+//             msg.sender == position.owner || _validateManager(position.owner),
+//             "!closePosition"
+//         );
+
+//         // Check product
+//         Product storage product = products[uint256(position.productId)];
+
+//         bool isFullClose;
+//         if (margin >= uint256(position.margin)) {
+//             margin = uint256(position.margin);
+//             isFullClose = true;
+//         }
+//         uint256 maxExposure = uint256(vault.balance)
+//             .mul(uint256(product.weight))
+//             .mul(exposureMultiplier)
+//             .div(uint256(totalWeight))
+//             .div(10**4);
+//         uint256 price = _calculatePrice(
+//             product.productToken,
+//             !position.isLong,
+//             product.openInterestLong,
+//             product.openInterestShort,
+//             maxExposure,
+//             uint256(product.reserve),
+//             (margin * position.leverage) / BASE
+//         );
+
+//         bool isLiquidatable;
+//         int256 pnl = PerpLib._getPnl(
+//             position.isLong,
+//             uint256(position.price),
+//             uint256(position.leverage),
+//             margin,
+//             price
+//         );
+//         if (
+//             pnl < 0 &&
+//             uint256(-1 * pnl) >=
+//             margin.mul(uint256(product.liquidationThreshold)).div(10**4)
+//         ) {
+//             margin = uint256(position.margin);
+//             pnl = -1 * int256(uint256(position.margin));
+//             isLiquidatable = true;
+//         } else {
+//             // front running protection: if oracle price up change is smaller than threshold and minProfitTime has not passed, the pnl is be set to 0
+//             if (
+//                 pnl > 0 &&
+//                 !PerpLib._canTakeProfit(
+//                     position.isLong,
+//                     uint256(position.timestamp),
+//                     uint256(position.oraclePrice),
+//                     IOracle(oracle).getPrice(product.productToken),
+//                     product.minPriceChange,
+//                     minProfitTime
+//                 )
+//             ) {
+//                 pnl = 0;
+//             }
+//         }
+
+//         uint256 totalFee = _updateVaultAndGetFee(
+//             pnl,
+//             position,
+//             margin,
+//             uint256(product.fee),
+//             uint256(product.interest),
+//             product.productToken
+//         );
+//         _updateOpenInterest(
+//             uint256(position.productId),
+//             margin.mul(uint256(position.leverage)).div(BASE),
+//             position.isLong,
+//             false
+//         );
+
+//         emit ClosePosition(
+//             positionId,
+//             position.owner,
+//             uint256(position.productId),
+//             price,
+//             uint256(position.price),
+//             margin,
+//             uint256(position.leverage),
+//             totalFee,
+//             pnl,
+//             isLiquidatable
+//         );
+
+//         if (isFullClose) {
+//             delete positions[positionId];
+//         } else {
+//             position.margin -= uint64(margin);
+//         }
+//     }
 
     // --- Owner ---
 
