@@ -7,6 +7,4 @@ interface IOracle {
         external
         view
         returns (uint256[] memory);
-    function getLastNPrices(address token, uint256 n) external view returns(uint256[] memory);
-
 }

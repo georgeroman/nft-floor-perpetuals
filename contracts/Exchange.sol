@@ -5,7 +5,11 @@ import {Owned} from "solmate/auth/Owned.sol";
 import {ERC4626} from "solmate/mixins/ERC4626.sol";
 import {WETH} from "solmate/tokens/WETH.sol";
 import {TrustusPacket} from "./interfaces/trustus/TrustusPacket.sol";
-import {PerpLib} from "./lib/PerpLib.sol";
+import {PerpLib} from "./PerpLib.sol";
+import {IOracle} from "./interfaces/IOracle.sol";
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/utils/math/SignedSafeMath.sol";
 
 import {Pool} from "./Pool.sol";
 
@@ -127,6 +131,25 @@ contract Exchange is Owned {
     // token BASE
     uint256 public constant BASE = 10**8;
 
+    // protocol reward collected
+    uint256 public pendingProtocolReward;
+
+    // pika token collected
+    uint256 public pendingTokenReward; 
+    
+    // pool reward collected
+    uint256 public pendingPoolReward; 
+
+    // 30%
+    uint256 public tokenRewardRatio = 3000;  
+
+    uint256 public protocolRewardRatio = 2000;  // 20%
+    
+    // total exposure weights of all product
+    uint256 public totalWeight; 
+
+    address public feeCalculator;
+
     // Mapping from NFT contract address to tradeable NFT product details
     mapping(address => NFTProduct) public nftProducts;
 
@@ -164,13 +187,14 @@ contract Exchange is Owned {
 
     // --- Constructor ---
 
-    constructor(address ownerAddress, address oracleAddress, address _token, uint256 _tokenBase)
+    constructor(address ownerAddress, address oracleAddress, address _token, uint256 _tokenBase, address _feeCalculator)
         Owned(ownerAddress)
     {
         oracle = oracleAddress;
         pool = address(new Pool(address(this)));
         token = _token;
         tokenBase = _tokenBase;
+        feeCalculator = _feeCalculator;
     }
 
     // --- Public ---
@@ -311,20 +335,79 @@ contract Exchange is Owned {
             "!liquidator"
         );
 
-        require(positionIds.length == nftAddresses, "Parameter arrays length must be equal");
+        require(positionIds.length == nftAddresses.length, "Parameter arrays length must be equal");
 
         uint256 totalLiquidatorReward;
         for (uint256 i = 0; i < positionIds.length; i++) {
             uint256 positionId = positionIds[i];
             uint256 liquidatorReward = liquidatePosition(positionId, nftAddresses[i]);
-            totalLiquidatorReward = totalLiquidatorReward.add(liquidatorReward);
+            totalLiquidatorReward = totalLiquidatorReward + liquidatorReward;
         }
         if (totalLiquidatorReward > 0) {
             IERC20(token).uniTransfer(
                 msg.sender,
-                totalLiquidatorReward.mul(tokenBase).div(BASE)
+                totalLiquidatorReward * (tokenBase/BASE)
             );
         }
+    }
+
+    // ---- Private ----
+
+    function _updateVaultAndGetFee(
+        int256 pnl,
+        Position memory position,
+        uint256 margin,
+        uint256 fee,
+        uint256 interest,
+        address productToken
+    ) private returns(uint256) {
+
+        (int256 pnlAfterFee, uint256 totalFee) = _getPnlWithFee(pnl, position, margin, fee, interest, productToken);
+        // Update vault
+        if (pnlAfterFee < 0) {
+            uint256 _pnlAfterFee = uint256(-1 * pnlAfterFee);
+            if (_pnlAfterFee < margin) {
+                IERC20(token).uniTransfer(position.owner, (margin.sub(_pnlAfterFee)).mul(tokenBase).div(BASE));
+                IERC20(token).transferFrom(msg.sender, address(this), _pnlAfterFee);
+            } else {
+                IERC20(token).transferFrom(msg.sender, address(this), margin);
+                return totalFee;
+            }
+
+        } else {
+            uint256 _pnlAfterFee = uint256(pnlAfterFee);
+            // Check vault
+            require(uint256(IERC20(token).balanceOf(address(this))) >= _pnlAfterFee, "!vault-insufficient");
+            IERC20(token).transferFrom(msg.sender, address(this), _pnlAfterFee);
+
+            IERC20(token).uniTransfer(position.owner, (margin.add(_pnlAfterFee)).mul(tokenBase).div(BASE));
+        }
+
+        pendingProtocolReward = pendingProtocolReward.add(totalFee.mul(protocolRewardRatio).div(10**4));
+        pendingTokenReward = pendingTokenReward.add(totalFee.mul(tokenRewardRatio).div(10**4));
+        pendingPoolReward = pendingPoolReward.add(totalFee.mul(10**4 - protocolRewardRatio - tokenRewardRatio).div(10**4));
+        IERC20(token).transferFrom(msg.sender, address(this), totalFee);
+
+        return totalFee;
+    }
+
+    function _getPnlWithFee(
+        int256 pnl,
+        Position memory position,
+        uint256 margin,
+        uint256 fee,
+        uint256 interest,
+        address productToken
+    ) private view returns(int256 pnlAfterFee, uint256 totalFee) {
+        // Subtract trade fee from P/L
+        uint256 tradeFee = PerpLib._getTradeFee(margin, uint256(position.leverage), fee, productToken, position.owner, feeCalculator);
+        pnlAfterFee = pnl.sub(int256(tradeFee));
+
+        // Subtract interest from P/L
+        uint256 interestFee = margin.mul(uint256(position.leverage)).mul(interest)
+            .mul(block.timestamp.sub(uint256(position.averageTimestamp))).div(uint256(10**12).mul(365 days));
+        pnlAfterFee = pnlAfterFee.sub(int256(interestFee));
+        totalFee = tradeFee.add(interestFee);
     }
 
     // NOT FINISHED
@@ -367,12 +450,12 @@ contract Exchange is Owned {
                 pendingProtocolReward = pendingProtocolReward.add(
                     remainingReward.mul(protocolRewardRatio).div(10**4)
                 );
-                pendingPikaReward = pendingPikaReward.add(
-                    remainingReward.mul(pikaRewardRatio).div(10**4)
+                pendingTokenReward = pendingTokenReward.add(
+                    remainingReward.mul(tokenRewardRatio).div(10**4)
                 );
-                pendingVaultReward = pendingVaultReward.add(
+                pendingPoolReward = pendingPoolReward.add(
                     remainingReward
-                        .mul(10**4 - protocolRewardRatio - pikaRewardRatio)
+                        .mul(10**4 - protocolRewardRatio - tokenRewardRatio)
                         .div(10**4)
                 );
                 IERC20(token).transferFrom(msg.sender, address(this), uint96(_pnl));
@@ -384,7 +467,7 @@ contract Exchange is Owned {
                 .mul(uint256(position.leverage))
                 .div(BASE);
 
-            PositionKind memory positionKind = PositionKind.LONG;
+            PositionKind positionKind = PositionKind.LONG;
 
             if (!position.isLong) {
                 positionKind = PositionKind.SHORT;
@@ -435,7 +518,6 @@ contract Exchange is Owned {
     // Closes position from Position with id = positionId
     function closePositionWithId(bytes32 positionId, uint256 margin, address nftContractAddress)
         public
-        nonReentrant
     {
         // Check position
         Position storage position = positions[positionId];
@@ -450,7 +532,7 @@ contract Exchange is Owned {
             isFullClose = true;
         }
         uint256 maxExposure = uint256(IERC20(token).balanceOf(address(this)))
-            .mul(uint256(nftProduct.weight))
+            .mul(uint256(product.weight))
             .mul(exposureMultiplier)
             .div(uint256(totalWeight))
             .div(10**4);
