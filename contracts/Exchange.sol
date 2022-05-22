@@ -5,7 +5,7 @@ import {Owned} from "solmate/auth/Owned.sol";
 import {ERC4626} from "solmate/mixins/ERC4626.sol";
 import {WETH} from "solmate/tokens/WETH.sol";
 import {TrustusPacket} from "./interfaces/trustus/TrustusPacket.sol";
-import {PerpLib} from "./interfaces/lib/PerpLib.sol";
+import {PerpLib} from "./lib/PerpLib.sol";
 
 import {Pool} from "./Pool.sol";
 
@@ -54,23 +54,13 @@ contract Exchange is Owned {
     // (a long position and/or a short position). The id of any position can
     // be computed via `keccak256(user, nft, kind)`.
     struct Position {
-        address owner,
+        address owner;
         uint256 margin;
         uint256 leverage;
         uint256 timestamp;
         uint256 price;
         uint256 oraclePrice;
         bool isLong;
-    }
-
-    struct Vault {
-        // 32 bytes
-        uint96 cap; // Maximum capacity. 12 bytes
-        uint96 balance; // 12 bytes
-        uint64 staked; // Total staked by users. 8 bytes
-        uint64 shares; // Total ownership shares. 8 bytes
-        // 32 bytes
-        uint32 stakingPeriod; // Time required to lock stake (seconds). 4 bytes
     }
 
     // --- Constants ---
@@ -137,8 +127,6 @@ contract Exchange is Owned {
     // token BASE
     uint256 public constant BASE = 10**8;
 
-    Vault private vault;
-
     // Mapping from NFT contract address to tradeable NFT product details
     mapping(address => NFTProduct) public nftProducts;
 
@@ -155,17 +143,24 @@ contract Exchange is Owned {
 
     event Log(address);
 
-    // event ClosePosition(
-    //             bytes32 positionId,
-    //             address positionOwner,
-    //             uint256 price,
-    //             uint256 positionPrice,
-    //             uint256 positionMargin,
-    //             uint256 positionLeverage,
-    //             uint256 fee,
-    //             int256 pnl,
-    //             bool wasLiquidated
-    // );
+    event ClosePosition(
+        bytes32 positionId,
+        address positionOwner,
+        uint256 price,
+        uint256 positionPrice,
+        uint256 positionMargin,
+        uint256 positionLeverage,
+        uint256 fee,
+        int256 pnl,
+        bool wasLiquidated
+    );
+
+    event PositionLiquidated(
+        bytes32 positionId,
+        address caller,
+        uint256 liquidatorReward,
+        uint256 remainingReward
+    );
 
     // --- Constructor ---
 
@@ -380,9 +375,9 @@ contract Exchange is Owned {
                         .mul(10**4 - protocolRewardRatio - pikaRewardRatio)
                         .div(10**4)
                 );
-                vault.balance += uint96(_pnl);
+                IERC20(token).transferFrom(msg.sender, address(this), uint96(_pnl));
             } else {
-                vault.balance += uint96(position.margin);
+                IERC20(token).transferFrom(msg.sender, address(this), uint96(position.margin));
             }
 
             uint256 amount = uint256(position.margin)
@@ -402,27 +397,27 @@ contract Exchange is Owned {
                 amount
             );
 
-            // emit ClosePosition(
-            //     positionId,
-            //     position.owner,
-            //     uint256(position.productId),
-            //     price,
-            //     uint256(position.price),
-            //     uint256(position.margin),
-            //     uint256(position.leverage),
-            //     0,
-            //     -1 * int256(uint256(position.margin)),
-            //     true
-            // );
+            emit ClosePosition(
+                positionId,
+                position.owner,
+                uint256(position.productId),
+                price,
+                uint256(position.price),
+                uint256(position.margin),
+                uint256(position.leverage),
+                0,
+                -1 * int256(uint256(position.margin)),
+                true
+            );
 
             delete positions[positionId];
 
-            // emit PositionLiquidated(
-            //     positionId,
-            //     msg.sender,
-            //     liquidatorReward,
-            //     remainingReward
-            // );
+            emit PositionLiquidated(
+                positionId,
+                msg.sender,
+                liquidatorReward,
+                remainingReward
+            );
         }
         return liquidatorReward;
     }
@@ -431,7 +426,7 @@ contract Exchange is Owned {
         address user,
         address nftContractAddress,
         PositionKind positionKind,
-        uint256 margin,
+        uint256 margin
     ) external {
         return
             closePositionWithId(getPositionId(user, nftContractAddress, positionKind), margin, nftContractAddress);
@@ -454,7 +449,7 @@ contract Exchange is Owned {
             margin = uint256(position.margin);
             isFullClose = true;
         }
-        uint256 maxExposure = uint256(vault.balance)
+        uint256 maxExposure = uint256(IERC20(token).balanceOf(address(this)))
             .mul(uint256(nftProduct.weight))
             .mul(exposureMultiplier)
             .div(uint256(totalWeight))
