@@ -5,15 +5,25 @@ import {Owned} from "solmate/auth/Owned.sol";
 import {ERC4626} from "solmate/mixins/ERC4626.sol";
 import {WETH} from "solmate/tokens/WETH.sol";
 import {TrustusPacket} from "./interfaces/trustus/TrustusPacket.sol";
-import {PerpLib} from "./PerpLib.sol";
+import {PerpLib} from "./lib/PerpLib.sol";
+import {UniERC20} from "./lib/UniERC20.sol";
 import {IOracle} from "./interfaces/IOracle.sol";
+
 import "@openzeppelin/contracts/utils/math/SafeMath.sol";
-import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/utils/math/SignedSafeMath.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 
 import {Pool} from "./Pool.sol";
 
 contract Exchange is Owned {
+
+    using SafeMath for uint256;
+    using SafeERC20 for IERC20;
+    using UniERC20 for IERC20;
+    using SignedSafeMath for int256;
+
     // The base currency of every payment is ETH
 
     // --- Structs and Enums ---
@@ -52,6 +62,8 @@ contract Exchange is Owned {
         uint256 openInterestShort;
         // the minimum oracle price up change for trader to close trade with profit
         uint16 minPriceChange; 
+        uint16 liquidationBounty;
+        uint16 weight;
     }
 
     // Each user can have at most two active positions on any particular NFT
@@ -65,6 +77,7 @@ contract Exchange is Owned {
         uint256 price;
         uint256 oraclePrice;
         bool isLong;
+        uint80 averageTimestamp;
     }
 
     // --- Constants ---
@@ -167,7 +180,6 @@ contract Exchange is Owned {
     event Log(address);
 
     event ClosePosition(
-        bytes32 positionId,
         address positionOwner,
         uint256 price,
         uint256 positionPrice,
@@ -322,14 +334,15 @@ contract Exchange is Owned {
             price: price,
             oraclePrice: IOracle(oracle).getPrice(nftContractAddress),
             timestamp: timestamp,
-            isLong: positionKind == PositionKind.LONG
+            isLong: positionKind == PositionKind.LONG,
+            averageTimestamp: position.margin == 0 ? uint80(block.timestamp) : uint80((uint256(position.margin).mul(uint256(position.timestamp)).add(margin.mul(block.timestamp))).div(uint256(position.margin).add(margin)))
         });
 
         // TODO: Emit event
     }
 
     // NOT FINISHED
-    function liquidatePositions(uint256[] calldata positionIds, address[] calldata nftAddresses) external {
+    function liquidatePositions(bytes32[] calldata positionIds, address[] calldata nftAddresses) external {
         require(
             liquidators[msg.sender] || allowPublicLiquidator,
             "!liquidator"
@@ -339,14 +352,14 @@ contract Exchange is Owned {
 
         uint256 totalLiquidatorReward;
         for (uint256 i = 0; i < positionIds.length; i++) {
-            uint256 positionId = positionIds[i];
+            bytes32 positionId = positionIds[i];
             uint256 liquidatorReward = liquidatePosition(positionId, nftAddresses[i]);
-            totalLiquidatorReward = totalLiquidatorReward + liquidatorReward;
+            totalLiquidatorReward = totalLiquidatorReward.add(liquidatorReward);
         }
         if (totalLiquidatorReward > 0) {
             IERC20(token).uniTransfer(
                 msg.sender,
-                totalLiquidatorReward * (tokenBase/BASE)
+                totalLiquidatorReward.mul(tokenBase).div(BASE)
             );
         }
     }
@@ -411,7 +424,7 @@ contract Exchange is Owned {
     }
 
     // NOT FINISHED
-    function liquidatePosition(uint256 positionId, address nftAddress)
+    function liquidatePosition(bytes32 positionId, address nftAddress)
         private
         returns (uint256 liquidatorReward)
     {
@@ -481,9 +494,7 @@ contract Exchange is Owned {
             );
 
             emit ClosePosition(
-                positionId,
                 position.owner,
-                uint256(position.productId),
                 price,
                 uint256(position.price),
                 uint256(position.margin),
@@ -509,14 +520,16 @@ contract Exchange is Owned {
         address user,
         address nftContractAddress,
         PositionKind positionKind,
-        uint256 margin
+        uint256 margin,
+        uint256 oraclePrice,
+        uint256 amount
     ) external {
         return
-            closePositionWithId(getPositionId(user, nftContractAddress, positionKind), margin, nftContractAddress);
+            closePositionWithId(getPositionId(user, nftContractAddress, positionKind), margin, nftContractAddress, positionKind, oraclePrice, amount);
     }
 
     // Closes position from Position with id = positionId
-    function closePositionWithId(bytes32 positionId, uint256 margin, address nftContractAddress)
+    function closePositionWithId(bytes32 positionId, uint256 margin, address nftContractAddress, PositionKind positionKind, uint256 oraclePrice, uint256 amount)
         public
     {
         // Check position
@@ -537,13 +550,18 @@ contract Exchange is Owned {
             .div(uint256(totalWeight))
             .div(10**4);
         uint256 price = _calculatePrice(
-            nftContractAddress,
-            !position.isLong,
+            positionKind,
             product.openInterestLong,
             product.openInterestShort,
-            maxExposure,
-            uint256(product.reserve),
-            (margin * position.leverage) / BASE
+            // Each individual NFT product has available only a share of the pool's total balance
+            (Pool(payable(pool)).totalAssets() *
+                product.maxExposureWeight *
+                exposureMultiplier) /
+                totalMaxExposureWeight /
+                BPS,
+            product.reserve,
+            amount, 
+            oraclePrice
         );
 
         bool isLiquidatable;
@@ -585,19 +603,17 @@ contract Exchange is Owned {
             margin,
             uint256(product.fee),
             uint256(product.interest),
-            product.productToken
+            token
         );
         _updateOpenInterest(
-            uint256(position.productId),
-            margin.mul(uint256(position.leverage)).div(BASE),
-            position.isLong,
-            false
+            nftContractAddress,
+            positionKind,
+            OrderKind.CLOSE,
+            amount
         );
 
         emit ClosePosition(
-            positionId,
             position.owner,
-            uint256(position.productId),
             price,
             uint256(position.price),
             margin,
@@ -639,6 +655,8 @@ contract Exchange is Owned {
         product.openInterestLong = 0;
         product.openInterestShort = 0;
         product.minPriceChange = 0;
+        product.liquidationBounty = nftProduct.liquidationBounty;
+        product.weight = nftProduct.weight;
 
         totalMaxExposureWeight += nftProduct.maxExposureWeight;
 
