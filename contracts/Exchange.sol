@@ -5,6 +5,7 @@ import {Owned} from "solmate/auth/Owned.sol";
 import {ERC4626} from "solmate/mixins/ERC4626.sol";
 import {WETH} from "solmate/tokens/WETH.sol";
 import {TrustusPacket} from "./interfaces/trustus/TrustusPacket.sol";
+import {PerpLib} from "./interfaces/lib/PerpLib.sol";
 
 import {Pool} from "./Pool.sol";
 
@@ -45,17 +46,31 @@ contract Exchange is Owned {
         // Open interest by position kind
         uint256 openInterestLong;
         uint256 openInterestShort;
+        // the minimum oracle price up change for trader to close trade with profit
+        uint16 minPriceChange; 
     }
 
     // Each user can have at most two active positions on any particular NFT
     // (a long position and/or a short position). The id of any position can
     // be computed via `keccak256(user, nft, kind)`.
     struct Position {
+        address owner,
         uint256 margin;
         uint256 leverage;
         uint256 timestamp;
         uint256 price;
+        uint256 oraclePrice;
         bool isLong;
+    }
+
+    struct Vault {
+        // 32 bytes
+        uint96 cap; // Maximum capacity. 12 bytes
+        uint96 balance; // 12 bytes
+        uint64 staked; // Total staked by users. 8 bytes
+        uint64 shares; // Total ownership shares. 8 bytes
+        // 32 bytes
+        uint32 stakingPeriod; // Time required to lock stake (seconds). 4 bytes
     }
 
     // --- Constants ---
@@ -101,6 +116,9 @@ contract Exchange is Owned {
     // Used to adjust the price to balance longs and shorts
     uint256 public maxShift = 0.003e8;
 
+    // The time window where minProfit is effective
+    uint256 public minProfitTime = 6 hours; 
+
     // Trusted address of the oracle responsible for pricing and settling new orders
     address public oracle;
 
@@ -119,6 +137,7 @@ contract Exchange is Owned {
     // token BASE
     uint256 public constant BASE = 10**8;
 
+    Vault private vault;
 
     // Mapping from NFT contract address to tradeable NFT product details
     mapping(address => NFTProduct) public nftProducts;
@@ -278,9 +297,11 @@ contract Exchange is Owned {
         }
 
         positions[positionId] = Position({
+            owner: msg.sender,
             margin: margin,
             leverage: leverage,
             price: price,
+            oraclePrice: IOracle(oracle).getPrice(nftContractAddress),
             timestamp: timestamp,
             isLong: positionKind == PositionKind.LONG
         });
@@ -317,9 +338,9 @@ contract Exchange is Owned {
         returns (uint256 liquidatorReward)
     {
         Position storage position = positions[positionId];
-        if (position.productId == 0) {
-            return 0;
-        }
+        // if (position.productId == 0) {
+        //     return 0;
+        // }
         NFTProduct storage product = nftProducts[nftAddress];
         uint256 price = IOracle(oracle).getPrice(nftAddress); // use oracle price for liquidation
 
@@ -406,118 +427,115 @@ contract Exchange is Owned {
         return liquidatorReward;
     }
 
-    //     function closePosition(
-//         address user,
-//         uint256 productId,
-//         uint256 margin,
-//         bool isLong
-//     ) external {
-//         return
-//             closePositionWithId(getPositionId(user, productId, isLong), margin);
-//     }
+    function closePosition(
+        address user,
+        address nftContractAddress,
+        PositionKind positionKind,
+        uint256 margin,
+    ) external {
+        return
+            closePositionWithId(getPositionId(user, nftContractAddress, positionKind), margin, nftContractAddress);
+    }
 
-//     // Closes position from Position with id = positionId
-//     function closePositionWithId(uint256 positionId, uint256 margin)
-//         public
-//         nonReentrant
-//     {
-//         // Check position
-//         Position storage position = positions[positionId];
-//         require(
-//             msg.sender == position.owner || _validateManager(position.owner),
-//             "!closePosition"
-//         );
+    // Closes position from Position with id = positionId
+    function closePositionWithId(bytes32 positionId, uint256 margin, address nftContractAddress)
+        public
+        nonReentrant
+    {
+        // Check position
+        Position storage position = positions[positionId];
+        require(msg.sender == position.owner, "!closePosition");
 
-//         // Check product
-//         Product storage product = products[uint256(position.productId)];
+        // Check product
+        NFTProduct storage product = nftProducts[nftContractAddress];
 
-//         bool isFullClose;
-//         if (margin >= uint256(position.margin)) {
-//             margin = uint256(position.margin);
-//             isFullClose = true;
-//         }
-//         uint256 maxExposure = uint256(vault.balance)
-//             .mul(uint256(product.weight))
-//             .mul(exposureMultiplier)
-//             .div(uint256(totalWeight))
-//             .div(10**4);
-//         uint256 price = _calculatePrice(
-//             product.productToken,
-//             !position.isLong,
-//             product.openInterestLong,
-//             product.openInterestShort,
-//             maxExposure,
-//             uint256(product.reserve),
-//             (margin * position.leverage) / BASE
-//         );
+        bool isFullClose;
+        if (margin >= uint256(position.margin)) {
+            margin = uint256(position.margin);
+            isFullClose = true;
+        }
+        uint256 maxExposure = uint256(vault.balance)
+            .mul(uint256(nftProduct.weight))
+            .mul(exposureMultiplier)
+            .div(uint256(totalWeight))
+            .div(10**4);
+        uint256 price = _calculatePrice(
+            nftContractAddress,
+            !position.isLong,
+            product.openInterestLong,
+            product.openInterestShort,
+            maxExposure,
+            uint256(product.reserve),
+            (margin * position.leverage) / BASE
+        );
 
-//         bool isLiquidatable;
-//         int256 pnl = PerpLib._getPnl(
-//             position.isLong,
-//             uint256(position.price),
-//             uint256(position.leverage),
-//             margin,
-//             price
-//         );
-//         if (
-//             pnl < 0 &&
-//             uint256(-1 * pnl) >=
-//             margin.mul(uint256(product.liquidationThreshold)).div(10**4)
-//         ) {
-//             margin = uint256(position.margin);
-//             pnl = -1 * int256(uint256(position.margin));
-//             isLiquidatable = true;
-//         } else {
-//             // front running protection: if oracle price up change is smaller than threshold and minProfitTime has not passed, the pnl is be set to 0
-//             if (
-//                 pnl > 0 &&
-//                 !PerpLib._canTakeProfit(
-//                     position.isLong,
-//                     uint256(position.timestamp),
-//                     uint256(position.oraclePrice),
-//                     IOracle(oracle).getPrice(product.productToken),
-//                     product.minPriceChange,
-//                     minProfitTime
-//                 )
-//             ) {
-//                 pnl = 0;
-//             }
-//         }
+        bool isLiquidatable;
+        int256 pnl = PerpLib._getPnl(
+            position.isLong,
+            uint256(position.price),
+            uint256(position.leverage),
+            margin,
+            price
+        );
+        if (
+            pnl < 0 &&
+            uint256(-1 * pnl) >=
+            margin.mul(uint256(product.liquidationThreshold)).div(10**4)
+        ) {
+            margin = uint256(position.margin);
+            pnl = -1 * int256(uint256(position.margin));
+            isLiquidatable = true;
+        } else {
+            // front running protection: if oracle price up change is smaller than threshold and minProfitTime has not passed, the pnl is be set to 0
+            if (
+                pnl > 0 &&
+                !PerpLib._canTakeProfit(
+                    position.isLong,
+                    uint256(position.timestamp),
+                    position.oraclePrice,
+                    IOracle(oracle).getPrice(nftContractAddress),
+                    product.minPriceChange,
+                    minProfitTime
+                )
+            ) {
+                pnl = 0;
+            }
+        }
 
-//         uint256 totalFee = _updateVaultAndGetFee(
-//             pnl,
-//             position,
-//             margin,
-//             uint256(product.fee),
-//             uint256(product.interest),
-//             product.productToken
-//         );
-//         _updateOpenInterest(
-//             uint256(position.productId),
-//             margin.mul(uint256(position.leverage)).div(BASE),
-//             position.isLong,
-//             false
-//         );
+        uint256 totalFee = _updateVaultAndGetFee(
+            pnl,
+            position,
+            margin,
+            uint256(product.fee),
+            uint256(product.interest),
+            product.productToken
+        );
+        _updateOpenInterest(
+            uint256(position.productId),
+            margin.mul(uint256(position.leverage)).div(BASE),
+            position.isLong,
+            false
+        );
 
-//         emit ClosePosition(
-//             positionId,
-//             position.owner,
-//             uint256(position.productId),
-//             price,
-//             uint256(position.price),
-//             margin,
-//             uint256(position.leverage),
-//             totalFee,
-//             pnl,
-//             isLiquidatable
-//         );
+        emit ClosePosition(
+            positionId,
+            position.owner,
+            uint256(position.productId),
+            price,
+            uint256(position.price),
+            margin,
+            uint256(position.leverage),
+            totalFee,
+            pnl,
+            isLiquidatable
+        );
 
-//         if (isFullClose) {
-//             delete positions[positionId];
-//         } else {
-//             position.margin -= uint64(margin);
-//         }
-//     }
+        if (isFullClose) {
+            delete positions[positionId];
+        } else {
+            position.margin -= uint64(margin);
+        }
+    }
 
     // --- Owner ---
 
@@ -543,6 +561,7 @@ contract Exchange is Owned {
         product.reserve = nftProduct.reserve;
         product.openInterestLong = 0;
         product.openInterestShort = 0;
+        product.minPriceChange = 0;
 
         totalMaxExposureWeight += nftProduct.maxExposureWeight;
 
