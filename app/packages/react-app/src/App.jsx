@@ -1,6 +1,11 @@
 import { useQuery } from "@apollo/client";
 import { Contract } from "@ethersproject/contracts";
-import { shortenAddress, useCall, useEthers, useLookupAddress } from "@usedapp/core";
+import {
+  shortenAddress,
+  useCall,
+  useEthers,
+  useLookupAddress,
+} from "@usedapp/core";
 import React, { useEffect, useState } from "react";
 
 import { Body, Button, Container, Header, Image, Link } from "./components";
@@ -51,16 +56,19 @@ function App() {
   // Read more about useDapp on https://usedapp.io/
   const { error: contractCallError, value: tokenBalance } =
     useCall({
-       contract: new Contract(addresses.ceaErc20, abis.erc20),
-       method: "balanceOf",
-       args: ["0x3f8CB69d9c0ED01923F11c829BaE4D9a4CB6c82C"],
+      contract: new Contract(addresses.ceaErc20, abis.erc20),
+      method: "balanceOf",
+      args: ["0x3f8CB69d9c0ED01923F11c829BaE4D9a4CB6c82C"],
     }) ?? {};
 
   const { loading, error: subgraphQueryError, data } = useQuery(GET_TRANSFERS);
 
   useEffect(() => {
     if (subgraphQueryError) {
-      console.error("Error while querying subgraph:", subgraphQueryError.message);
+      console.error(
+        "Error while querying subgraph:",
+        subgraphQueryError.message
+      );
       return;
     }
     if (!loading && data && data.transfers) {
@@ -74,15 +82,25 @@ function App() {
         <WalletButton />
       </Header>
       <Body>
-        <Image src={logo} alt="ethereum-logo" />
-        <p>
-          Edit <code>packages/react-app/src/App.js</code> and save to reload.
-        </p>
-        <Link href="https://reactjs.org">
-          Learn React
-        </Link>
-        <Link href="https://usedapp.io/">Learn useDapp</Link>
-        <Link href="https://thegraph.com/docs/quick-start">Learn The Graph</Link>
+        <div className="flex flex-col items-center justify-center space-y-8">
+          <i className="nes-pokeball"></i>
+          <h1 className="text-3xl md:text-7xl text-center dark:text-white">
+            Floor Sweep
+          </h1>
+          <p className="max-w-xs md:max-w-prose text-2xl md:text-3xl text-center dark:text-white">
+            Get 5X Leverage on NFTs derivatives
+            <br />
+            <br />
+            Perpetuals Exchange based on NFTs Floor Price
+            <br />
+            <br />
+          </p>
+          <div className="space-y-2 flex flex-col items-center justify-center">
+            <button className="text-3xl px-4 border-4  text-white hover:text-gray-500">
+              Join the degeneracy
+            </button>
+          </div>
+        </div>
       </Body>
     </Container>
   );

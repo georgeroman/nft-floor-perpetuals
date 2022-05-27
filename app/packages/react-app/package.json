@@ -15,10 +15,11 @@
     ]
   },
   "dependencies": {
-    "@my-app/contracts": "^1.0.0",
     "@apollo/client": "^3.5.10",
+    "@craco/craco": "^6.4.3",
     "@ethersproject/contracts": "^5.6.0",
     "@ethersproject/providers": "^5.6.0",
+    "@my-app/contracts": "^1.0.0",
     "@testing-library/dom": "^8.11.3",
     "@testing-library/jest-dom": "^5.16.2",
     "@testing-library/react": "^12.1.4",
@@ -39,10 +40,15 @@
     ]
   },
   "scripts": {
-    "build": "react-scripts build",
+    "build": "craco build",
     "eject": "react-scripts eject",
     "ipfs": "yarn build && ipfs-deploy build/",
-    "start": "react-scripts start",
-    "test": "react-scripts test"
+    "start": "craco start",
+    "test": "craco test"
+  },
+  "devDependencies": {
+    "autoprefixer": "^9",
+    "postcss": "^7",
+    "tailwindcss": "npm:@tailwindcss/postcss7-compat"
   }
 }
